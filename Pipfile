@@ -1,0 +1,16 @@
+[[source]]
+name = "pypi"
+verify_ssl = true
+url = "https://pypi.org/simple"
+
+[dev-packages]
+pylint = "*"
+
+[packages]
+wand = "*"
+requests = "*"
+"bs4" = "*"
+"boto3" = "*"
+
+[requires]
+python_version = "3.6"

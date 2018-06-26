@@ -181,17 +181,20 @@ def emojify(event, _):
         password = os.environ['EMOJIFY_PASSWORD']
 
         # Process the SNS message.
+        print('SNS MESSAGE: {}'.format(event['Records'][0]['Sns']['Message']))
         message = json.loads(event['Records'][0]['Sns']['Message'])
+        user_id = message['user_id']
         response_url = message['response_url']
 
         # Process the command.
         print('COMMAND LINE: ' + message['command'])
         args = parse_command_line(message['command'])
         print('COMMAND BEGIN')
-        message = args.func(args, url, email, password)
-        print('COMMAND COMPLETE: ' + message)
+        success_message = '{}, thanks <@{}>!'.format(
+            args.func(args, url, email, password), user_id)
+        print('COMMAND COMPLETE: ' + success_message)
         requests.post(response_url,
-                      data=json.dumps({'text': message,
+                      data=json.dumps({'text': success_message,
                                        'response_type': 'in_channel'}))
     # pylint: disable=broad-except
     except Exception as exc:
@@ -236,6 +239,7 @@ def dispatch(event, _):
         # Publish an SNS notification to invoke the second-state lambda.
         message = {
             "response_url": params['response_url'][0],
+            "user_id": params['user_id'][0],
             "command": command
         }
         response = boto3.client('sns').publish(

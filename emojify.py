@@ -1,4 +1,5 @@
-"""Manipulates slack emojis."""
+"""Manipulates slack emojis. Designed to run as either a command-line
+application or as an AWS Lambda pair."""
 
 import argparse
 import json
@@ -6,12 +7,14 @@ import os
 import re
 import shlex
 import sys
-import time
+import traceback
+import urllib.parse
 import urllib.request
 
 import boto3
 import bs4
 import requests
+import slackclient
 import wand.image
 
 class ArgumentParser(argparse.ArgumentParser):
@@ -52,18 +55,14 @@ def square_crop_and_resize(image, size):
 
     image.resize(size, size)
 
-def emoji_session(url, email, password):
-    """Creates a Slack session on the customize emoji page."""
+def get_slack_client(url, email, password):
+    """Instantiates a SlackClient using a token we get through login."""
 
     session = requests.session()
-
-    # Get the login page and extract the "crumb" from it.
     response = session.get(url)
     response.raise_for_status()
     soup = bs4.BeautifulSoup(response.text, "html.parser")
     crumb = soup.find("input", attrs={"name": "crumb"})["value"]
-
-    # Issue a login request, and get the next "crumb".
     data = {'signin': 1,
             'redir': '/customize/emoji',
             'crumb': crumb,
@@ -72,113 +71,96 @@ def emoji_session(url, email, password):
             'password': password}
     response = session.post(url, data=data)
     response.raise_for_status()
-    soup = bs4.BeautifulSoup(response.text, "html.parser")
-    crumb = soup.find("input", attrs={"name": "crumb"})["value"]
+    api_token_regex = re.compile('api_token: "([a-z0-9-]*)",')
+    api_token = api_token_regex.search(response.text).groups()[0]
+    return slackclient.SlackClient(api_token)
 
-    return (session, crumb, response.text)
+def get_slack_client_from_env():
+    """Instantiates a slack client using a team name, email, and password
+    retreived from environment variables."""
 
-def upload_emoji(image, name, url, email, password):
+    url = 'https://{}.slack.com'.format(os.environ['EMOJIFY_TEAM_NAME'])
+    email = os.environ['EMOJIFY_EMAIL']
+    password = os.environ['EMOJIFY_PASSWORD']
+    return get_slack_client(url, email, password)
+
+def assert_emoji(client, exists=None, not_exists=None):
+    """Makes sure a particular emoji exists and/or does not exist."""
+
+    emojis = client.api_call('emoji.list')
+    if 'ok' not in emojis or not emojis['ok'] or 'emoji' not in emojis:
+        raise Exception('failed to call emoji.list')
+    if exists and exists not in emojis['emoji']:
+        raise Exception('Emoji {} does not exist.'.format(exists))
+    if not_exists and not_exists in emojis['emoji']:
+        raise Exception('Emoji {} already exists.'.format(not_exists))
+
+def add_emoji(client, image, name):
     """Uploads an image file as an emoji to Slack. The image is expected to be
     at most 128x128 and 64k."""
 
-    (session, crumb, response_text) = emoji_session(url, email, password)
-
-    if ':{}:'.format(name) in response_text:
-        raise Exception('Emoji {} already exists.'.format(name))
-
-    # Issue an add emoji request.
-    data = {'add': 1,
-            'crumb': crumb,
-            'name': name,
-            'mode': 'data',
-            'alias': '',
-            'resized': ''}
-    files = {'img': ('emoji_filename', image.make_blob(), image.mimetype)}
-    response = session.post(url + '/customize/emoji',
-                            data=data,
-                            files=files)
+    # Use requests rather than the slack client because the syntax to make the
+    # SlackClient upload the image is unclear.
+    assert_emoji(client, not_exists=name)
+    data = {'mode': 'data', 'name': name, 'token': client.token}
+    files = {'image': ('emoji_filename', image.make_blob(), image.mimetype)}
+    response = requests.post('https://slack.com/api/emoji.add',
+                             data=data,
+                             files=files)
     response.raise_for_status()
 
-def delete_emoji(name, url, email, password):
+def remove_emoji(client, name):
     """Deletes an emoji by name."""
+    assert_emoji(client, exists=name)
+    client.api_call('emoji.remove', name=name)
 
-    (session, _, response_text) = emoji_session(url, email, password)
+def alias_emoji(client, target, alias):
+    """Aliases an emoji such that alias is the same emoji as target."""
+    assert_emoji(client, exists=target, not_exists=alias)
+    client.api_call('emoji.add', mode='alias', name=alias, alias_for=target)
 
-    if not ':{}:'.format(name) in response_text:
-        raise Exception('Emoji {} does not exist.'.format(name))
-
-    version_uid_regex = re.compile('version_uid: "([a-f0-9]*)",')
-    api_token_regex = re.compile('api_token: "([a-z0-9-]*)",')
-    version_uid = version_uid_regex.search(response_text).groups()[0][0:8]
-    api_token = api_token_regex.search(response_text).groups()[0]
-    xid = "{0}-{1:.3f}".format(version_uid, float(time.time()))
-    delete_url = url + '/api/emoji.remove?_x_id={}'.format(xid)
-    files = {'name': (None, name), 'token': (None, api_token)}
-    response = session.post(delete_url, files=files)
-    response.raise_for_status()
-
-def alias_emoji(name, target, url, email, password):
-    """Aliases an emoji such that name is the same emoji as target."""
-
-    (session, crumb, response_text) = emoji_session(url, email, password)
-
-    if ':{}:'.format(name) in response_text:
-        raise Exception('Emoji {} already exists.'.format(name))
-    if not ':{}:'.format(target) in response_text:
-        raise Exception('Emoji {} does not exist.'.format(target))
-
-    files = {'add':     (None, '1'),
-             'crumb':   (None, crumb),
-             'name':    (None, name),
-             'mode':    (None, 'alias'),
-             'alias':   (None, target),
-             'resized': (None, '')}
-    response = session.post(url + '/customize/emoji', files=files)
-    response.raise_for_status()
-
-def handle_create(args, url, email, password):
+def handle_add(client, args):
     """Handle a create command, which has 'url' and 'name' arguments."""
     image_file = urllib.request.urlopen(args.url)
     with wand.image.Image(file=image_file) as image:
         square_crop_and_resize(image, 128)
-        upload_emoji(image, args.name, url, email, password)
-    return 'Created emoji {} :{}:'.format(args.name, args.name)
+        add_emoji(client, image, args.name)
+    return 'Created emoji {0} :{0}:'.format(args.name)
 
-def handle_delete(args, url, email, password):
+def handle_remove(client, args):
     """Handle a delete command, which has just a 'name' argument."""
-    delete_emoji(args.name, url, email, password)
+    remove_emoji(client, args.name)
     return 'Deleted emoji {}'.format(args.name)
 
-def handle_alias(args, url, email, password):
+def handle_alias(client, args):
     """Handle an alias command, which has 'name' and 'target' arguments."""
-    alias_emoji(args.name, args.target, url, email, password)
-    return 'Aliased emoji {} links to {}'.format(args.name, args.target)
+    alias_emoji(client, args.target, args.alias)
+    return 'Aliased emoji {} links to {}'.format(args.alias, args.target)
 
-def parse_command_line(cmdline):
+def parse_command_line(cmdline=None):
     """Parse the slack slash-command command-line arguments."""
     parser = ArgumentParser()
     subparsers = parser.add_subparsers()
-    create_parser = subparsers.add_parser('create')
+    create_parser = subparsers.add_parser('add')
     create_parser.add_argument('name')
     create_parser.add_argument('url')
-    create_parser.set_defaults(func=handle_create)
-    delete_parser = subparsers.add_parser('delete')
+    create_parser.set_defaults(func=handle_add)
+    delete_parser = subparsers.add_parser('remove')
     delete_parser.add_argument('name')
-    delete_parser.set_defaults(func=handle_delete)
+    delete_parser.set_defaults(func=handle_remove)
     alias_parser = subparsers.add_parser("alias")
-    alias_parser.add_argument('name')
     alias_parser.add_argument('target')
+    alias_parser.add_argument('alias')
     alias_parser.set_defaults(func=handle_alias)
-    args = parser.parse_args(shlex.split(cmdline))
+    if cmdline:
+        args = parser.parse_args(shlex.split(cmdline))
+    else:
+        args = parser.parse_args()
     return args
 
 def emojify(event, _):
     """Entry point for the lambda that actually does the processing."""
     try:
-        # Process the environment variables.
-        url = 'https://{}.slack.com'.format(os.environ['EMOJIFY_TEAM_NAME'])
-        email = os.environ['EMOJIFY_EMAIL']
-        password = os.environ['EMOJIFY_PASSWORD']
 
         # Process the SNS message.
         print('SNS MESSAGE: {}'.format(event['Records'][0]['Sns']['Message']))
@@ -191,7 +173,7 @@ def emojify(event, _):
         args = parse_command_line(message['command'])
         print('COMMAND BEGIN')
         success_message = '{}, thanks <@{}>!'.format(
-            args.func(args, url, email, password), user_id)
+            args.func(get_slack_client_from_env(), args), user_id)
         print('COMMAND COMPLETE: ' + success_message)
         requests.post(response_url,
                       data=json.dumps({'text': success_message,
@@ -199,6 +181,7 @@ def emojify(event, _):
     # pylint: disable=broad-except
     except Exception as exc:
         print('COMMAND ERROR: ' + str(exc))
+        traceback.print_exc()
         requests.post(response_url, data=json.dumps({'text': str(exc)}))
     # pylint: enable=broad-except
 
@@ -226,10 +209,11 @@ def dispatch(event, _):
 
         if 'text' not in params or not params['text']:
             return generate_response('Usage:\n' +
-                                     '/emojify create [name] [url]\n' +
-                                     '/emojify delete [name]\n' +
-                                     '/emojify alias [name] [target]')
+                                     '/emojify add [name] [url]\n' +
+                                     '/emojify remove [name]\n' +
+                                     '/emojify alias [target] [alias]')
         command = params['text'][0]
+        print('DISPATCH COMMAND: ' + command)
 
         # Parse the command-line arguments here even though the next lambda
         # also parses them. This allows us to respond immediately to ill-formed
@@ -252,5 +236,15 @@ def dispatch(event, _):
         return generate_response('Processing command "{}"...'.format(command))
     # pylint: disable=broad-except
     except Exception as exc:
+        print('DISPATCH ERROR: ' + str(exc))
+        traceback.print_exc()
         return generate_response(str(exc))
     # pylint: enable=broad-except
+
+def main():
+    """Process the command given on the command line."""
+    args = parse_command_line()
+    print(args.func(get_slack_client_from_env(), args))
+
+if __name__ == '__main__':
+    main()

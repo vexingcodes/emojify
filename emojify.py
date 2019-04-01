@@ -71,7 +71,7 @@ def get_slack_client(url, email, password):
             'password': password}
     response = session.post(url, data=data)
     response.raise_for_status()
-    api_token_regex = re.compile('api_token: "([a-z0-9-]*)",')
+    api_token_regex = re.compile('"api_token":"([a-z0-9-]*)",')
     api_token = api_token_regex.search(response.text).groups()[0]
     return slackclient.SlackClient(api_token)
 

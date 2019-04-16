@@ -12,8 +12,6 @@ requests = "*"
 "bs4" = "*"
 "boto3" = "*"
 slackclient = "*"
-imagemagick = "*"
-freetype = "*"
 
 [requires]
 python_version = "3.6"

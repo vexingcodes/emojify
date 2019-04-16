@@ -27,8 +27,7 @@ class ArgumentParser(argparse.ArgumentParser):
         exc = sys.exc_info()[1]
         if exc:
             raise exc
-        else:
-            raise Exception('Error: {}'.format(message))
+        raise Exception('Error: {}'.format(message))
 
 def square_crop_and_resize(image, size):
     """Crops an image to be square by removing pixels evenly from both sides of

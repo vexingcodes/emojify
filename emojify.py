@@ -61,7 +61,7 @@ def get_slack_client(url, email, password):
     response = session.get(url)
     response.raise_for_status()
     soup = bs4.BeautifulSoup(response.text, "html.parser")
-    crumb = soup.find("input", attrs={"name": "crumb"})["value"]
+    crumb = json.loads(soup.find(id='props_node')['data-props'])['crumbValue']
     data = {'signin': 1,
             'redir': '/customize/emoji',
             'crumb': crumb,
